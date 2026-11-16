@@ -1,0 +1,463 @@
+//Macro for 3-channel puncta analysis.
+//This macro is used to quantifiy Internalized 488-PFF by removing Surface bound PFF signal identifi4ed by 2F11 staining. 
+//A = mask channel (e.g. MAP2, mCherry), B = puncta channel to measure (e.g.488-FF), C = puncta channel used to filter B (2F11) 
+//Workflow per image:
+// 1. Threshold A, B and C (Manual / Auto / Set Value / From .csv)
+// 2. Detect C puncta and B puncta with Analyze Particles (optional min/max size, optional watershed of B)
+// 3. For each B punctum, calculate the % of ITS OWN area covered by C puncta. B puncta with overlap >= cutoff are removed.
+// 4. The remaining B puncta are intersected with the A mask (clipped at the A boundary) and the area inside A is reported.
+//Outputs: ROIs (A, B all with overlap in the ROI name, B kept, C), binary mask JPEGs (white background, black signal),
+//Results.csv (same format as the 2-channel macro, 4 rows per image) and Summary.csv (1 row per image: counts and %). The overlap % of each B punctum is in its ROI name.
+
+setOption("BlackBackground", true);
+
+input = getDirectory("Choose folder for starting images");
+File.setDefaultDir(input);
+output = getDirectory("Choose output folder");
+list = getFileList(input);
+list = Array.sort(list);
+var Label2Array, thrLo, thrHi, scale, sRow;
+
+//Channel/Scale parameters
+macroName = "Macro_3channel_B-C-overlap-filter_in_A.ijm";
+Dialog.create("Experiment Info");
+Dialog.addString("Experiment name", "Experiment", 30);
+Dialog.addNumber("Pixel Scale:", 0.10049847,8,8,"(um/pixel)");
+Dialog.addNumber("How many starting channels?",4,0,1,"channel/s");
+Dialog.addString("Name Index", ".tif");
+Dialog.show();
+expName = Dialog.getString();
+scale = Dialog.getNumber();
+numChan = Dialog.getNumber();
+nameindex = Dialog.getString();
+
+//Experiment name used in the Metadata file name (characters not allowed in file names are replaced by -)
+expFile = replace(expName, "[\\\\/:*?\"<>|]", "-");
+if (lengthOf(expFile) == 0) expFile = "Experiment";
+
+//Date and time of the start of the run (for the metadata log)
+getDateAndTime(year, month, dayOfWeek, dayOfMonth, hour, minute, second, msec);
+runDate = ""+year+"-"+IJ.pad(month+1,2)+"-"+IJ.pad(dayOfMonth,2);
+runTime = ""+IJ.pad(hour,2)+":"+IJ.pad(minute,2);
+
+if (numChan < 3) exit("This macro needs at least 3 channels.");
+channel = newArray("C1","C2","C3","C4");
+chan = Array.trim(channel, numChan);
+
+options = newArray("Manual","Auto","Set Value","From .csv");
+Dialog.create("Channel Assignment");
+Dialog.addChoice("Channel A (mask)", chan, chan[0]);
+Dialog.addChoice("Channel B (puncta to measure)", chan, chan[1]);
+Dialog.addChoice("Channel C (puncta used to filter B)", chan, chan[2]);
+Dialog.addChoice("Thresholding A", options);
+Dialog.addChoice("Thresholding B", options);
+Dialog.addChoice("Thresholding C", options);
+Dialog.addString("Name of A (mask)", "MAP2");
+Dialog.addString("Name of B", "pSyn");
+Dialog.addString("Name of C", "C");
+Dialog.addNumber("Remove B puncta overlapping C by at least", 25, 1, 5, "% of B punctum area");
+Dialog.addNumber("B puncta minimum size", 0, 4, 8, "um^2");
+Dialog.addString("B puncta maximum size", "Infinity");
+Dialog.addNumber("C puncta minimum size", 0, 4, 8, "um^2");
+Dialog.addString("C puncta maximum size", "Infinity");
+Dialog.addCheckbox("Watershed B puncta before overlap test", false);
+Dialog.show();
+
+achan = Dialog.getChoice();
+bchan = Dialog.getChoice();
+cchan = Dialog.getChoice();
+modeA = Dialog.getChoice();
+modeB = Dialog.getChoice();
+modeC = Dialog.getChoice();
+aName = Dialog.getString();
+bName = Dialog.getString();
+cName = Dialog.getString();
+maxB = Dialog.getString();
+maxC = Dialog.getString();
+cutoff = Dialog.getNumber();
+minB = Dialog.getNumber();
+minC = Dialog.getNumber();
+watershedB = Dialog.getCheckbox();
+
+//Names typed in the dialog are carried into the .csv files (spaces replaced by _ in column names)
+aCol = replace(aName, " ", "_");
+bCol = replace(bName, " ", "_");
+cCol = replace(cName, " ", "_");
+
+if (achan == bchan || achan == cchan || bchan == cchan) exit("Channels A, B and C must be three different channels.");
+
+//Set values
+setvalA = 0; setvalB = 0; setvalC = 0;
+if (modeA == "Set Value" || modeB == "Set Value" || modeC == "Set Value") {
+	Dialog.create("Set Thresholding");
+	if (modeA == "Set Value") Dialog.addNumber(aName+" ("+achan+") Threshold", 0);
+	if (modeB == "Set Value") Dialog.addNumber(bName+" ("+bchan+") Threshold", 0);
+	if (modeC == "Set Value") Dialog.addNumber(cName+" ("+cchan+") Threshold", 0);
+	Dialog.show();
+	if (modeA == "Set Value") setvalA = Dialog.getNumber();
+	if (modeB == "Set Value") setvalB = Dialog.getNumber();
+	if (modeC == "Set Value") setvalC = Dialog.getNumber();
+}
+
+//Loading .csv with individual file thresholding (columns: File, C1, C2, ...)
+Label2Array = newArray();
+if (modeA == "From .csv" || modeB == "From .csv" || modeC == "From .csv") {
+	path2 = File.openDialog("Select a .csv of threshold measurements");
+	Table.open(path2);
+	Table.rename(Table.title, "Threshold");
+	Label2Array = Table.getColumn("File", "Threshold");
+}
+
+//Generating output folders
+zipfile = output+"ROIs";
+jpgDir = output+"Mask JPEGs";
+jpgA = jpgDir+File.separator+aName+File.separator;
+jpgB = jpgDir+File.separator+bName+File.separator;
+jpgC = jpgDir+File.separator+cName+File.separator;
+jpgBk = jpgDir+File.separator+bName+" after "+cName+" removal"+File.separator;
+File.makeDirectory(zipfile);
+File.makeDirectory(jpgDir);
+File.makeDirectory(jpgA);
+File.makeDirectory(jpgB);
+File.makeDirectory(jpgC);
+File.makeDirectory(jpgBk);
+
+run("Clear Results");
+Table.create("Summary");
+sRow = 0;
+Table.create("Metadata");
+mRow = 0;
+run("Set Measurements...", "area mean perimeter integrated area_fraction limit display redirect=None decimal=5");
+
+//Batch mode is only used when no manual thresholding is needed (manual needs visible images)
+if (modeA != "Manual" && modeB != "Manual" && modeC != "Manual") setBatchMode(true);
+
+for (f = 0; f < list.length; f++) {
+	if (indexOf(list[f], nameindex) < 0) continue;
+	open(input+list[f]);
+	title = getTitle();
+	endindex = indexOf(title, nameindex);
+	newtitle = substring(list[f], 0, endindex);
+
+	run("Split Channels");
+	nameA = achan+"-"+title;
+	nameB = bchan+"-"+title;
+	nameC = cchan+"-"+title;
+
+	names = newArray(nameA, nameB, nameC);
+	for (k = 0; k < 3; k++) {
+		selectImage(names[k]);
+		run("Properties...", "channels=1 slices=1 frames=1 unit=um pixel_width="+scale+" pixel_height="+scale+" voxel_depth=1");
+	}
+	selectImage(nameA);
+	getDimensions(w, h, channels, slices, frames);
+
+	//Thresholds (A keeps the settings of the original macro's mask channel; B and C those of its measured channel)
+	getThr(nameA, modeA, aName, achan, "Default dark 16-bit no-reset", setvalA, newtitle);
+	loA = thrLo; hiA = thrHi;
+	getThr(nameB, modeB, bName, bchan, "Default dark", setvalB, newtitle);
+	loB = thrLo; hiB = thrHi;
+	getThr(nameC, modeC, cName, cchan, "Default dark", setvalC, newtitle);
+	loC = thrLo; hiC = thrHi;
+	makeMask(nameB, "Bthr", loB, hiB); //all thresholded B (no size filter, no removal) for the Results rows
+
+	// ---------- A: mask ----------
+	makeMask(nameA, "Amask", loA, hiA);
+	selectImage("Amask");
+	roiManager("reset");
+	run("Create Selection");
+	if (selectionType() != -1) {
+		roiManager("Add");
+		roiManager("Select", 0);
+		roiManager("Rename", title+" "+aName+" "+loA);
+		roiManager("deselect");
+		roiManager("save", zipfile+File.separator+newtitle+"_"+aName+" T"+loA+"_ROI.zip");
+	}
+	selectImage("Amask");
+	run("Select None");
+	roiManager("reset");
+
+	// ---------- C: puncta used for filtering ----------
+	makeMask(nameC, "Cmask0", loC, hiC);
+	selectImage("Cmask0");
+	findParticles(minC, maxC);
+	nC = roiManager("count");
+	newMask("Cfinal", w, h);
+	if (nC > 0) {
+		fillIndexes(Array.getSequence(nC));
+		roiManager("deselect");
+		roiManager("save", zipfile+File.separator+newtitle+"_"+cName+" T"+loC+"_ROI.zip");
+	}
+	roiManager("reset");
+
+	// ---------- B: puncta to measure ----------
+	makeMask(nameB, "Bmask0", loB, hiB);
+	if (watershedB) {
+		selectImage("Bmask0");
+		run("Watershed");
+	}
+	selectImage("Bmask0");
+	findParticles(minB, maxB);
+	nB = roiManager("count");
+
+	// overlap of each B punctum with the C mask
+	keptArr = newArray();
+	remArr = newArray();
+	selectImage("Cfinal");
+	for (i = 0; i < nB; i++) {
+		roiManager("select", i);
+		getStatistics(area, mean);
+		frac = mean/255;
+		pct = frac*100;
+		if (pct >= cutoff) {
+			status = "REMOVED";
+			remArr = Array.concat(remArr, i);
+		} else {
+			status = "KEPT";
+			keptArr = Array.concat(keptArr, i);
+		}
+		roiManager("rename", bName+(i+1)+"_ovl"+cName+d2s(pct,1)+"pct_"+status);
+	}
+	nKept = keptArr.length;
+	nRem = remArr.length;
+
+	// save all B ROIs (names carry overlap % and KEPT/REMOVED)
+	if (nB > 0) {
+		roiManager("deselect");
+		roiManager("save", zipfile+File.separator+newtitle+"_"+bName+" T"+loB+"_ROI-all.zip");
+	}
+
+	// binary images of kept and removed B puncta
+	newMask("Bkept", w, h);
+	fillIndexes(keptArr);
+	newMask("Bremoved", w, h);
+	fillIndexes(remArr);
+	// keep only the pixels that are really above the B threshold (the ROI polygons can include enclosed holes)
+	imageCalculator("AND", "Bkept", "Bthr");
+	imageCalculator("AND", "Bremoved", "Bthr");
+
+	// save kept B ROIs only (remove the rejected ones from the manager first)
+	if (nRem > 0) {
+		if (nRem == 1) roiManager("select", remArr[0]);
+		else roiManager("select", remArr);
+		roiManager("delete");
+	}
+	if (nKept > 0) {
+		roiManager("deselect");
+		roiManager("save", zipfile+File.separator+newtitle+"_"+bName+" T"+loB+"_ROI-kept-after-"+cName+"-removal.zip");
+	}
+	roiManager("reset");
+
+	// ---------- remaining B puncta inside A ----------
+	imageCalculator("AND create", "Bkept", "Amask");
+	rename("BfinalInA");
+
+	aArea = maskArea("Amask");
+	cArea = maskArea("Cfinal");
+	keptArea = maskArea("Bkept");
+	remArea = maskArea("Bremoved");
+	inA = maskArea("BfinalInA");
+	pctInA = 0;
+	pctOfA = 0;
+	if (keptArea > 0) pctInA = 100*inA/keptArea;
+	if (aArea > 0) pctOfA = 100*inA/aArea;
+
+	// ---------- mask JPEGs: white background, black signal (A, B, C and B after C removal) ----------
+	saveMaskJpeg("Amask", jpgA+newtitle+"_"+aName+"_mask.jpg");
+	saveMaskJpeg("Bthr", jpgB+newtitle+"_"+bName+"_mask.jpg");
+	saveMaskJpeg("Cfinal", jpgC+newtitle+"_"+cName+"_mask.jpg");
+	saveMaskJpeg("Bkept", jpgBk+newtitle+"_"+bName+"_mask_after_"+cName+"_removal.jpg");
+
+	// ---------- Results.csv: same format as the original macro (4 rows per image) ----------
+	// Row 1: A mask area | Row 2: all thresholded B | Row 3: B after removal of puncta overlapping C | Row 4: those remaining B puncta inside A
+	// The columns Channel and Description carry the names typed in the dialog
+	measureRow(nameA, "Amask", aName+"-"+title, loA, hiA, aName, aName+" mask (thresholded)");
+	measureRow(nameB, "Bthr", bName+"-"+title, loB, hiB, bName, bName+" thresholded (all puncta)");
+	measureRow(nameB, "Bkept", bName+"-"+title+"Thresholded after "+cName+" removal", loB, hiB, bName, bName+" thresholded after removal of puncta overlapping "+cName);
+	measureRow(nameB, "BfinalInA", bName+"-"+title+"Thresholded after "+cName+" removal in ROI", loB, hiB, bName, bName+" after "+cName+" removal, inside "+aName+" mask");
+
+	// ---------- Summary.csv: one row per image ----------
+	Table.set("Image", sRow, newtitle, "Summary");
+	Table.set("Overlap_cutoff_pct", sRow, cutoff, "Summary");
+	Table.set(aCol+"_area_um2", sRow, aArea, "Summary");
+	Table.set(cCol+"_n", sRow, nC, "Summary");
+	Table.set(cCol+"_area_um2", sRow, cArea, "Summary");
+	Table.set(bCol+"_n_total", sRow, nB, "Summary");
+	Table.set(bCol+"_n_removed_overlap_"+cCol, sRow, nRem, "Summary");
+	Table.set(bCol+"_n_kept", sRow, nKept, "Summary");
+	Table.set(bCol+"_area_removed_um2", sRow, remArea, "Summary");
+	Table.set(bCol+"_area_kept_um2", sRow, keptArea, "Summary");
+	Table.set(bCol+"_kept_inside_"+aCol+"_um2", sRow, inA, "Summary");
+	Table.set("Pct_"+bCol+"_kept_inside_"+aCol, sRow, pctInA, "Summary");
+	Table.set("Pct_"+aCol+"_covered_by_"+bCol+"_kept", sRow, pctOfA, "Summary");
+	sRow++;
+
+	// ---------- Metadata.csv: one row per image with the settings used ----------
+	Table.set("Experiment", mRow, expName, "Metadata");
+	Table.set("Date", mRow, runDate, "Metadata");
+	Table.set("Time", mRow, runTime, "Metadata");
+	Table.set("Macro", mRow, macroName, "Metadata");
+	Table.set("Image", mRow, newtitle, "Metadata");
+	Table.set("Input_folder", mRow, input, "Metadata");
+	Table.set("Output_folder", mRow, output, "Metadata");
+	Table.set("Pixel_scale_um_per_pixel", mRow, scale, "Metadata");
+	Table.set(aCol+"_channel", mRow, achan, "Metadata");
+	Table.set(aCol+"_threshold_mode", mRow, modeA, "Metadata");
+	Table.set(aCol+"_threshold_min", mRow, loA, "Metadata");
+	Table.set(aCol+"_threshold_max", mRow, hiA, "Metadata");
+	Table.set(bCol+"_channel", mRow, bchan, "Metadata");
+	Table.set(bCol+"_threshold_mode", mRow, modeB, "Metadata");
+	Table.set(bCol+"_threshold_min", mRow, loB, "Metadata");
+	Table.set(bCol+"_threshold_max", mRow, hiB, "Metadata");
+	Table.set(cCol+"_channel", mRow, cchan, "Metadata");
+	Table.set(cCol+"_threshold_mode", mRow, modeC, "Metadata");
+	Table.set(cCol+"_threshold_min", mRow, loC, "Metadata");
+	Table.set(cCol+"_threshold_max", mRow, hiC, "Metadata");
+	Table.set(bCol+"_min_size_um2", mRow, minB, "Metadata");
+	Table.set(bCol+"_max_size_um2", mRow, maxB, "Metadata");
+	Table.set(cCol+"_min_size_um2", mRow, minC, "Metadata");
+	Table.set(cCol+"_max_size_um2", mRow, maxC, "Metadata");
+	Table.set("Watershed_"+bCol, mRow, watershedB, "Metadata");
+	Table.set("Overlap_cutoff_pct_"+bCol+"_with_"+cCol, mRow, cutoff, "Metadata");
+	mRow++;
+
+	close("*");
+	roiManager("reset");
+}
+roiManager("reset");
+setBatchMode(false);
+setOption("BlackBackground", false); //restores the setting used by the other macros
+getDateAndTime(year, month, dayOfWeek, dayOfMonth, hour, minute, second, msec);
+newmonth = month+1;
+stamp = ""+year+"-"+newmonth+"-"+dayOfMonth; //the leading "" is needed, otherwise the macro language returns NaN
+saveAs("Results", output+File.separator+stamp+" Results.csv");
+if (sRow > 0) Table.save(output+File.separator+stamp+" Summary.csv", "Summary");
+if (mRow > 0) Table.save(output+File.separator+expFile+" Metadata.csv", "Metadata");
+print("Done. Results saved with date stamp "+stamp);
+
+
+// ================= functions =================
+
+// Determines the threshold range of one channel. Result goes to thrLo / thrHi (thrLo = -1 means no threshold -> empty mask)
+function getThr(img, mode, label, chanId, autoStr, setVal, key) {
+	selectImage(img);
+	resetThreshold();
+	maxv = pow(2, bitDepth()) - 1;
+	thrLo = -1;
+	thrHi = maxv;
+	if (mode == "Auto") {
+		setAutoThreshold(autoStr);
+		getThreshold(thrLo, thrHi);
+	} else if (mode == "Manual") {
+		run("Threshold...");
+		waitForUser("Set threshold for "+label+" ("+chanId+") and click OK");
+		getThreshold(thrLo, thrHi);
+	} else if (mode == "Set Value") {
+		thrLo = setVal;
+	} else if (mode == "From .csv") {
+		for (i = 0; i < lengthOf(Label2Array); i++) {
+			if (startsWith(Label2Array[i], key)) {
+				thrLo = Table.get(chanId, i, "Threshold");
+			}
+		}
+	}
+	resetThreshold();
+}
+
+// Binary mask (255 = signal) from a raw channel. Empty mask if no threshold was set.
+function makeMask(src, dst, lo, hi) {
+	selectImage(src);
+	getDimensions(ww, hh, cc, ss, ff);
+	if (lo < 0) {
+		newMask(dst, ww, hh);
+		return;
+	}
+	run("Duplicate...", "title="+dst);
+	setThreshold(lo, hi);
+	run("Convert to Mask");
+}
+
+// Blank calibrated 8-bit image
+function newMask(name, ww, hh) {
+	newImage(name, "8-bit black", ww, hh, 1);
+	run("Properties...", "channels=1 slices=1 frames=1 unit=um pixel_width="+scale+" pixel_height="+scale+" voxel_depth=1");
+}
+
+// Area (calibrated) of the 255 pixels in a binary image
+function maskArea(name) {
+	selectImage(name);
+	run("Select None");
+	getStatistics(ar, mn);
+	return ar*mn/255;
+}
+
+// Fills the ROIs with the given ROI Manager indexes (255) on the active image, one ROI at a time
+// (faster than merging all the ROIs into one selection first)
+function fillIndexes(arr) {
+	setColor(255);
+	for (k = 0; k < arr.length; k++) {
+		roiManager("select", arr[k]);
+		fill();
+	}
+	run("Select None");
+}
+
+// Saves a binary mask as JPEG with white background and black signal (the mask image itself is not changed)
+function saveMaskJpeg(maskImg, path) {
+	selectImage(maskImg);
+	run("Select None");
+	run("Duplicate...", "title=jpgtmp");
+	run("Invert");
+	saveAs("Jpeg", path);
+	close();
+}
+
+// Analyze Particles into the ROI Manager. Any rows it might add to the Results table are deleted again.
+function findParticles(minS, maxS) {
+	nBefore = nResults;
+	run("Analyze Particles...", "size="+d2s(minS,6)+"-"+maxS+" show=Nothing add");
+	if (nResults > nBefore) IJ.deleteRows(nBefore, nResults-1);
+}
+
+// Adds one row to Results in the original macro's format: measures the thresholded pixels (lo-hi) of rawImg
+// inside the signal of maskImg. If there is no signal, a row of zeros is written (as in the original macro).
+function measureRow(rawImg, maskImg, label, lo, hi, chanName, desc) {
+	roiManager("reset");
+	selectImage(maskImg);
+	run("Select None");
+	run("Create Selection");
+	hasSel = (selectionType() != -1);
+	if (hasSel) roiManager("Add");
+	run("Select None");
+	if (hasSel && lo >= 0) {
+		selectImage(rawImg);
+		rename(label);
+		setThreshold(lo, hi);
+		roiManager("Select", 0);
+		roiManager("Measure");
+		rn = nResults-1;
+		setResult("Channel", rn, chanName);
+		setResult("Description", rn, desc);
+		updateResults();
+		resetThreshold();
+		run("Select None");
+		rename(rawImg);
+	} else {
+		n = nResults;
+		setResult("Label",     n, label);
+		setResult("Channel",   n, chanName);
+		setResult("Description", n, desc);
+		setResult("Area",      n, 0);
+		setResult("Mean",      n, 0);
+		setResult("Min",       n, 0);
+		setResult("Max",       n, 0);
+		setResult("Perim.",    n, 0);
+		setResult("IntDen",    n, 0);
+		setResult("%Area",     n, 0);
+		setResult("RawIntDen", n, 0);
+		setResult("MinThr",    n, lo);
+		setResult("MaxThr",    n, hi);
+		updateResults();
+	}
+	roiManager("reset");
+}
